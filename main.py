@@ -49,8 +49,7 @@ VAST_API_BASE = os.environ.get("VAST_API_BASE", "https://console.vast.ai/api/v0"
 
 # SSH tunnel constants
 VAST_SSH_PORT = 2222
-SSH_LOCAL_PORT = 6666
-SSH_REMOTE_PORT = 6666
+LLAMA_PORT = 6969
 SSH_USER = "fox"
 
 STARTUP_TIMEOUT = int(os.environ.get("STARTUP_TIMEOUT", "900"))
@@ -234,14 +233,14 @@ async def check_tcp_port(ip: str, port: int) -> bool:
 async def connect_instance(ip: str, host_port: int) -> asyncio.subprocess.Process:
     cmd = [
         "ssh",
-        "-L", f"{SSH_LOCAL_PORT}:localhost:{SSH_REMOTE_PORT}",
+        "-L", f"{LLAMA_PORT}:127.0.0.1:8080",
         "-p", str(host_port),
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
         "-o", "ServerAliveInterval=10",
         "-o", "ServerAliveCountMax=3",
         f"{SSH_USER}@{ip}",
-        "exec /server.sh",
+        f"exec /server.sh {LLAMA_MODEL_URL}",
     ]
     log.info("Connecting to instance: %s", " ".join(cmd))
     return await asyncio.create_subprocess_exec(*cmd)
