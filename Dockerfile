@@ -3,7 +3,7 @@ FROM ghcr.io/ggml-org/llama.cpp:server-cuda
 RUN apt-get update && \
     apt-get install -y --no-install-recommends dropbear && \
     rm -rf /var/lib/apt/lists/* && \
-    useradd -m -s /bin/sh fox
+    useradd -m -s /bin/bash fox
 
 COPY rootfs/ /
 
