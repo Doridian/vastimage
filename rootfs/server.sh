@@ -8,4 +8,4 @@ else
     echo 'Model already exists at /models/download.gguf, skipping download.'
 fi
 
-exec /app/llama-server --host :: --port "${LLAMA_PORT:-8080}" --model /models/download.gguf --threads "$(nproc)" "$@"
+exec /app/llama-server --host 127.0.0.1 --port 6666 --model /models/download.gguf --threads "$(nproc)" "$@"

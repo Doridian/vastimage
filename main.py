@@ -1,53 +1,34 @@
 #!/usr/bin/env python3
 """
-vast_roo_gateway.py
+vast_instance.py
 
-OpenAI-compatible gateway for:
-
-  Roo Code / VS Code
-          ↓
-     this gateway
-          ↓
-   Vast.ai instance
-     running llama.cpp
+Starts a Vast.ai instance and opens an SSH tunnel, then waits until interrupted.
 
 Behavior:
 - Reuse an existing Vast instance if its GPU is in the RTX PRO 6000 family
   (base / S / WS all accepted)
 - Otherwise find the cheapest matching offer on Vast
 - Create a new instance only if the cheapest offer is <= MAX_HOURLY_PRICE
-- Start the instance on demand
-- Wait for remote llama.cpp server to become healthy
-- Proxy /v1/* requests to the remote llama.cpp server
-- Stop or destroy the instance after an idle timeout
+- Start the instance and wait for SSH port to become available
+- Open an SSH local-port-forward tunnel (localhost:6666 -> remote:6666)
+- Stop or destroy the instance on exit
 
 Requirements:
-    pip install fastapi "uvicorn[standard]" httpx
+    pip install httpx
 
 Example:
     export VAST_API_KEY="..."
-    export GATEWAY_API_KEY="local-secret"
 
     # Required: model to load in llama.cpp
     export LLAMA_MODEL_URL="https://huggingface.co/unsloth/Qwen3-Coder-Next-GGUF/resolve/main/Qwen3-Coder-Next-UD-Q4_K_XL.gguf"
-
-    # Optional extra llama-server args
-    export LLAMA_ARGS="--ctx-size 8192"
 
     # Optional HF token for gated/private models
     export HF_TOKEN="hf_..."
 
     export MAX_HOURLY_PRICE="1.00"
     export INSTANCE_ACTION="stop"   # or "destroy"
-    export IDLE_SECONDS="900"
 
-    uvicorn vast_roo_gateway:app --host 127.0.0.1 --port 8089
-
-Roo Code:
-- Provider: OpenAI Compatible
-- Base URL: http://127.0.0.1:8089/v1
-- API Key: same as GATEWAY_API_KEY
-- Model: whatever LLAMA_MODEL_URL is set to
+    python vast_instance.py
 """
 
 import asyncio
@@ -55,29 +36,23 @@ import logging
 import os
 import re
 import time
-from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import PlainTextResponse, StreamingResponse
 
 # -----------------------------------------------------------------------------
 # Config
 # -----------------------------------------------------------------------------
 
 VAST_API_KEY = os.environ.get("VAST_API_KEY", "").strip()
-GATEWAY_API_KEY = os.environ.get("GATEWAY_API_KEY", "").strip()
-
 VAST_API_BASE = os.environ.get("VAST_API_BASE", "https://console.vast.ai/api/v0").rstrip("/")
 
-# Remote llama.cpp endpoint info
-VAST_LLAMA_PORT = 8080
-# Optional manual override — set this to a CF tunnel URL or any base URL and
-# the gateway will use it directly without touching the ports field.
-# e.g. REMOTE_BASE_URL="https://keith-fascinating-nearby-decide.trycloudflare.com"
-REMOTE_BASE_URL = os.environ.get("REMOTE_BASE_URL", "").strip()
-REMOTE_SCHEME = os.environ.get("REMOTE_SCHEME", "http").strip()
-HEALTHCHECK_PATH = os.environ.get("HEALTHCHECK_PATH", "/v1/models")
+# SSH tunnel constants
+VAST_SSH_PORT = 2222
+SSH_LOCAL_PORT = 6666
+SSH_REMOTE_PORT = 6666
+SSH_USER = "fox"
+
 STARTUP_TIMEOUT = int(os.environ.get("STARTUP_TIMEOUT", "900"))
 HEALTHCHECK_INTERVAL = float(os.environ.get("HEALTHCHECK_INTERVAL", "3"))
 
@@ -90,26 +65,19 @@ SEARCH_LIMIT = int(os.environ.get("SEARCH_LIMIT", "50"))
 VAST_IMAGE = os.environ.get("VAST_IMAGE", "ghcr.io/doridian/vastimage/vastimage:latest").strip()
 
 # Create-instance config
-VAST_DISK_GB = float(os.environ.get("VAST_DISK_GB", "200"))
-INSTANCE_LABEL = os.environ.get("INSTANCE_LABEL", "roo-vast-rtx-pro-6000").strip()
+VAST_DISK_GB = float(os.environ.get("VAST_DISK_GB", "100"))
+INSTANCE_LABEL = os.environ.get("INSTANCE_LABEL", "vastimage-controlled").strip()
 
 # llama.cpp env options
 LLAMA_MODEL_URL = os.environ.get("LLAMA_MODEL_URL", "").strip()
-HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
 
-# Idle shutdown
-IDLE_SECONDS = int(os.environ.get("IDLE_SECONDS", "900"))
+# Shutdown action
 INSTANCE_ACTION = os.environ.get("INSTANCE_ACTION", "stop").strip().lower()  # stop | destroy
-
-# Proxy timeout
-PROXY_TIMEOUT = float(os.environ.get("PROXY_TIMEOUT", "1800"))
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
 if not VAST_API_KEY:
     raise RuntimeError("VAST_API_KEY is required")
-if not GATEWAY_API_KEY:
-    raise RuntimeError("GATEWAY_API_KEY is required")
 if not LLAMA_MODEL_URL:
     raise RuntimeError("LLAMA_MODEL_URL is required")
 if INSTANCE_ACTION not in {"stop", "destroy"}:
@@ -119,21 +87,17 @@ logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-log = logging.getLogger("vast-roo-gateway")
-
-app = FastAPI(title="Vast Roo Gateway")
+log = logging.getLogger("vast-instance")
 
 # -----------------------------------------------------------------------------
 # Mutable state
 # -----------------------------------------------------------------------------
 
 state_lock = asyncio.Lock()
-last_used_ts = 0.0
-inflight_requests = 0
 
 current_instance_id: Optional[int] = None
-current_remote_base_url: Optional[str] = None
 instance_ready = False
+ssh_process: Optional[asyncio.subprocess.Process] = None
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -233,13 +197,12 @@ def instance_destroyed(instance: Dict[str, Any]) -> bool:
     return False
 
 
-def build_remote_base_direct(instance: Dict[str, Any]) -> Optional[str]:
+def get_ssh_host_and_port(instance: Dict[str, Any]) -> Optional[Tuple[str, int]]:
     ip = extract_public_ip(instance)
     if not ip:
         return None
-    # ports = {"8080/tcp": [{"HostIp": "0.0.0.0", "HostPort": "26096"}, ...], ...}
     ports: Dict[str, Any] = instance.get("ports") or {}
-    mappings = ports.get(f"{VAST_LLAMA_PORT}/tcp") or []
+    mappings = ports.get(f"{VAST_SSH_PORT}/tcp") or []
     host_port = None
     for m in mappings:
         if isinstance(m, dict) and m.get("HostIp") in ("0.0.0.0", ""):
@@ -248,20 +211,40 @@ def build_remote_base_direct(instance: Dict[str, Any]) -> Optional[str]:
     if not host_port and mappings:
         host_port = mappings[0].get("HostPort") if isinstance(mappings[0], dict) else None
     if not host_port:
-        log.debug("No host port mapping yet for %s/tcp on instance %s", VAST_LLAMA_PORT, instance.get("id"))
+        log.debug("No host port mapping yet for %s/tcp on instance %s", VAST_SSH_PORT, instance.get("id"))
         return None
-    return f"{REMOTE_SCHEME}://{ip}:{host_port}"
+    return (ip, int(host_port))
 
 
-
-async def probe_remote_llamacpp(base_url: str) -> bool:
-    url = f"{base_url}{HEALTHCHECK_PATH}"
+async def check_tcp_port(ip: str, port: int) -> bool:
     try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            r = await client.get(url, headers={"Authorization": "Bearer dummy"})
-            return r.status_code < 500
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection(ip, port), timeout=5.0
+        )
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return True
     except Exception:
         return False
+
+
+async def connect_instance(ip: str, host_port: int) -> asyncio.subprocess.Process:
+    cmd = [
+        "ssh",
+        "-L", f"{SSH_LOCAL_PORT}:localhost:{SSH_REMOTE_PORT}",
+        "-p", str(host_port),
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ServerAliveInterval=10",
+        "-o", "ServerAliveCountMax=3",
+        f"{SSH_USER}@{ip}",
+        "exec /server.sh",
+    ]
+    log.info("Connecting to instance: %s", " ".join(cmd))
+    return await asyncio.create_subprocess_exec(*cmd)
 
 
 # -----------------------------------------------------------------------------
@@ -278,7 +261,7 @@ async def vast_show_instances(client: httpx.AsyncClient) -> List[Dict[str, Any]]
 async def vast_show_instance(client: httpx.AsyncClient, instance_id: int) -> Dict[str, Any]:
     r = await client.get(f"{VAST_API_BASE}/instances/{instance_id}/", headers=vast_headers())
     if r.status_code == 404:
-        raise HTTPException(status_code=404, detail=f"Instance {instance_id} not found")
+        raise RuntimeError(f"Instance {instance_id} not found")
     r.raise_for_status()
     payload = r.json()
     if isinstance(payload, dict):
@@ -292,7 +275,7 @@ async def vast_show_instance(client: httpx.AsyncClient, instance_id: int) -> Dic
         # bare object fallback
         if "id" in payload:
             return payload
-    raise HTTPException(status_code=502, detail=f"Unexpected instance response: {list(payload.keys()) if isinstance(payload, dict) else payload}")
+    raise RuntimeError(f"Unexpected instance response: {list(payload.keys()) if isinstance(payload, dict) else payload}")
 
 
 async def vast_manage_instance(client: httpx.AsyncClient, instance_id: int, new_state: str) -> None:
@@ -349,9 +332,9 @@ async def vast_search_offers(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
 async def vast_create_instance_from_offer(client: httpx.AsyncClient, offer: Dict[str, Any]) -> int:
     ask_id = offer.get("ask_contract_id") or offer.get("id")
     if not ask_id:
-        raise HTTPException(status_code=502, detail="Offer missing ask ID")
+        raise RuntimeError("Offer missing ask ID")
 
-    env: Dict[str, str] = {f"-p {VAST_LLAMA_PORT}:{VAST_LLAMA_PORT}": "1"}
+    env: Dict[str, str] = {f"-p {VAST_SSH_PORT}:{VAST_SSH_PORT}": "1"}
     env["LLAMA_MODEL_URL"] = LLAMA_MODEL_URL
 
     body: Dict[str, Any] = {
@@ -374,7 +357,7 @@ async def vast_create_instance_from_offer(client: httpx.AsyncClient, offer: Dict
     payload = r.json()
     new_contract = payload.get("new_contract")
     if not isinstance(new_contract, int):
-        raise HTTPException(status_code=502, detail=f"Unexpected create-instance response: {payload}")
+        raise RuntimeError(f"Unexpected create-instance response: {payload}")
     return new_contract
 
 
@@ -436,21 +419,18 @@ async def choose_or_create_instance(client: httpx.AsyncClient) -> int:
     offers = await vast_search_offers(client)
     candidates = [o for o in offers if gpu_name_matches_rtx_pro_6000_family(str(o.get("gpu_name") or ""))]
     if not candidates:
-        raise HTTPException(status_code=503, detail="No matching RTX PRO 6000 / S / WS offers found on Vast")
+        raise RuntimeError("No matching RTX PRO 6000 / S / WS offers found on Vast")
 
     candidates.sort(key=rank_offer)
     best = candidates[0]
     best_price = extract_price_per_hour(best)
     if best_price is None:
-        raise HTTPException(status_code=503, detail="Matching offer found but price could not be determined")
+        raise RuntimeError("Matching offer found but price could not be determined")
 
     if best_price > MAX_HOURLY_PRICE:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                f"Cheapest matching RTX PRO 6000-family offer costs ${best_price:.2f}/hr, "
-                f"above MAX_HOURLY_PRICE=${MAX_HOURLY_PRICE:.2f}/hr"
-            ),
+        raise RuntimeError(
+            f"Cheapest matching RTX PRO 6000-family offer costs ${best_price:.2f}/hr, "
+            f"above MAX_HOURLY_PRICE=${MAX_HOURLY_PRICE:.2f}/hr"
         )
 
     log.info(
@@ -463,209 +443,89 @@ async def choose_or_create_instance(client: httpx.AsyncClient) -> int:
     return await vast_create_instance_from_offer(client, best)
 
 
-async def ensure_instance_ready() -> str:
-    global current_instance_id, current_remote_base_url, instance_ready
+async def ensure_instance_ready() -> None:
+    global current_instance_id, instance_ready, ssh_process
 
-    async with state_lock:
-        if instance_ready and current_instance_id and current_remote_base_url:
-            return current_remote_base_url
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        instance_id = await choose_or_create_instance(client)
+        current_instance_id = instance_id
 
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            instance_id = await choose_or_create_instance(client)
-            current_instance_id = instance_id
+        instance = await vast_show_instance(client, instance_id)
+        if not infer_running(instance):
+            log.info("Starting instance %s", instance_id)
+            await vast_manage_instance(client, instance_id, "running")
 
-            instance = await vast_show_instance(client, instance_id)
-            if not infer_running(instance):
-                log.info("Starting instance %s", instance_id)
-                await vast_manage_instance(client, instance_id, "running")
+        deadline = now() + STARTUP_TIMEOUT
+        last_err: Optional[Exception] = None
 
-            deadline = now() + STARTUP_TIMEOUT
-            last_err: Optional[Exception] = None
+        while now() < deadline:
+            try:
+                instance = await vast_show_instance(client, instance_id)
+                status = (
+                    instance.get("actual_status")
+                    or instance.get("cur_state")
+                    or instance.get("status")
+                    or "unknown"
+                )
+                log.info("Instance %s status: %s", instance_id, status)
+                if infer_running(instance):
+                    conn = get_ssh_host_and_port(instance)
+                    if not conn:
+                        log.info("Waiting for port mapping on instance %s...", instance_id)
+                        await asyncio.sleep(HEALTHCHECK_INTERVAL)
+                        continue
+                    ip, host_port = conn
+                    log.info("Probing SSH port %s:%s", ip, host_port)
+                    if await check_tcp_port(ip, host_port):
+                        log.info("SSH port available, starting tunnel")
+                        ssh_process = await connect_instance(ip, host_port)
+                        instance_ready = True
+                        log.info("SSH tunnel started for instance %s", instance_id)
+                        return
+                    log.info("SSH port not yet available at %s:%s, retrying...", ip, host_port)
+            except Exception as exc:
+                last_err = exc
+                log.warning("Error polling instance %s: %s", instance_id, exc)
 
-            while now() < deadline:
-                try:
-                    instance = await vast_show_instance(client, instance_id)
-                    status = (
-                        instance.get("actual_status")
-                        or instance.get("cur_state")
-                        or instance.get("status")
-                        or "unknown"
-                    )
-                    log.info("Instance %s status: %s", instance_id, status)
-                    if infer_running(instance):
-                        if REMOTE_BASE_URL:
-                            base = REMOTE_BASE_URL
-                        else:
-                            base = build_remote_base_direct(instance)
-                            if not base:
-                                log.info("Waiting for port mapping on instance %s...", instance_id)
-                                await asyncio.sleep(HEALTHCHECK_INTERVAL)
-                                continue
-                        log.info("Probing llama.cpp health at %s", base)
-                        if await probe_remote_llamacpp(base):
-                            current_remote_base_url = base
-                            instance_ready = True
-                            log.info("Remote llama.cpp ready at %s for instance %s", base, instance_id)
-                            return base
-                        log.info("llama.cpp not yet healthy at %s, retrying...", base)
-                except Exception as exc:
-                    last_err = exc
-                    log.warning("Error polling instance %s: %s", instance_id, exc)
+            await asyncio.sleep(HEALTHCHECK_INTERVAL)
 
-                await asyncio.sleep(HEALTHCHECK_INTERVAL)
-
-            detail = f"Timed out waiting for instance {instance_id} / llama.cpp readiness"
-            if last_err:
-                detail += f": {last_err}"
-            raise HTTPException(status_code=504, detail=detail)
+        detail = f"Timed out waiting for instance {instance_id} / SSH readiness"
+        if last_err:
+            detail += f": {last_err}"
+        raise RuntimeError(detail)
 
 
 # -----------------------------------------------------------------------------
-# Idle reaper
+# Main
 # -----------------------------------------------------------------------------
 
-async def idle_reaper() -> None:
-    global instance_ready, current_remote_base_url, current_instance_id
-
-    while True:
-        await asyncio.sleep(5)
-
-        try:
-            if not current_instance_id or not instance_ready or inflight_requests > 0:
-                continue
-            idle_for = now() - last_used_ts if last_used_ts else 0
-            if idle_for < IDLE_SECONDS:
-                continue
-
-            async with state_lock:
-                if not current_instance_id or not instance_ready or inflight_requests > 0:
-                    continue
-                idle_for = now() - last_used_ts if last_used_ts else 0
-                if idle_for < IDLE_SECONDS:
-                    continue
-
-                async with httpx.AsyncClient(timeout=60.0) as client:
-                    if INSTANCE_ACTION == "destroy":
-                        log.info("Idle timeout: destroying instance %s", current_instance_id)
-                        await vast_destroy_instance(client, current_instance_id)
-                        current_instance_id = None
-                    else:
-                        log.info("Idle timeout: stopping instance %s", current_instance_id)
-                        await vast_manage_instance(client, current_instance_id, "stopped")
-
-                current_remote_base_url = None
-                instance_ready = False
-
-        except Exception:
-            log.exception("Idle reaper error")
-
-
-# -----------------------------------------------------------------------------
-# Proxying
-# -----------------------------------------------------------------------------
-
-async def stream_upstream_response(
-    method: str,
-    url: str,
-    headers: Dict[str, str],
-    body: bytes,
-) -> tuple[int, Dict[str, str], AsyncIterator[bytes]]:
-    client = httpx.AsyncClient(timeout=httpx.Timeout(PROXY_TIMEOUT, connect=60.0))
-    req = client.build_request(method, url, headers=headers, content=body)
-    resp = await client.send(req, stream=True)
-
-    async def iterator() -> AsyncIterator[bytes]:
-        nonlocal client, resp
-        try:
-            async for chunk in resp.aiter_raw():
-                yield chunk
-        finally:
-            await resp.aclose()
-            await client.aclose()
-
-    passthrough = {}
-    for k, v in resp.headers.items():
-        if k.lower() in {"content-type", "cache-control", "x-request-id", "openai-processing-ms"}:
-            passthrough[k] = v
-
-    return resp.status_code, passthrough, iterator()
-
-
-async def proxy_request(request: Request, path: str) -> Response:
-    global last_used_ts, inflight_requests
-
-    base = await ensure_instance_ready()
-    upstream_url = f"{base}/v1/{path}"
-    body = await request.body()
-
-    upstream_headers: Dict[str, str] = {}
-    for k, v in request.headers.items():
-        lk = k.lower()
-        if lk in {"host", "content-length", "authorization"}:
-            continue
-        upstream_headers[k] = v
-
-    upstream_headers["Authorization"] = "Bearer dummy"
-
-    inflight_requests += 1
-    last_used_ts = now()
+async def main() -> None:
+    await ensure_instance_ready()
+    log.info("Instance ready. Press Ctrl+C to stop.")
     try:
-        status_code, headers, iterator = await stream_upstream_response(
-            method=request.method,
-            url=upstream_url,
-            headers=upstream_headers,
-            body=body,
-        )
-        return StreamingResponse(
-            iterator,
-            status_code=status_code,
-            headers=headers,
-            media_type=headers.get("content-type"),
-        )
+        if ssh_process is not None:
+            await ssh_process.wait()
+        else:
+            await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        pass
     finally:
-        inflight_requests -= 1
-        last_used_ts = now()
+        if ssh_process is not None:
+            log.info("Terminating SSH tunnel")
+            ssh_process.terminate()
+            try:
+                await asyncio.wait_for(ssh_process.wait(), timeout=5.0)
+            except Exception:
+                ssh_process.kill()
+        if current_instance_id is not None:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                if INSTANCE_ACTION == "destroy":
+                    log.info("Destroying instance %s", current_instance_id)
+                    await vast_destroy_instance(client, current_instance_id)
+                else:
+                    log.info("Stopping instance %s", current_instance_id)
+                    await vast_manage_instance(client, current_instance_id, "stopped")
 
 
-# -----------------------------------------------------------------------------
-# Routes
-# -----------------------------------------------------------------------------
-
-@app.on_event("startup")
-async def startup_event() -> None:
-    global last_used_ts
-    last_used_ts = now()
-    asyncio.create_task(idle_reaper())
-    log.info("Gateway started")
-
-@app.get("/")
-async def root() -> Dict[str, Any]:
-    return {
-        "service": "vast-roo-gateway",
-        "openai_base": "/v1",
-        "health": "/healthz",
-    }
-
-@app.get("/healthz")
-async def healthz() -> Dict[str, Any]:
-    return {
-        "ok": True,
-        "instance_id": current_instance_id,
-        "instance_ready": instance_ready,
-        "idle_seconds": IDLE_SECONDS,
-        "max_hourly_price": MAX_HOURLY_PRICE,
-        "instance_action": INSTANCE_ACTION,
-    }
-
-@app.get("/v1/models")
-async def models(request: Request) -> Response:
-    return await proxy_request(request, "models")
-
-@app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
-async def catchall_v1(path: str, request: Request) -> Response:
-    return await proxy_request(request, path)
-
-@app.exception_handler(Exception)
-async def unhandled_exception_handler(_: Request, exc: Exception) -> PlainTextResponse:
-    log.exception("Unhandled error: %s", exc)
-    return PlainTextResponse("Internal gateway error", status_code=500)
+if __name__ == "__main__":
+    asyncio.run(main())
