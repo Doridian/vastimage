@@ -245,15 +245,15 @@ async def fetch_host_pubkeys(client: httpx.AsyncClient, instance_id: int) -> Opt
     r2 = await client.get(result_url)
     if not r2.is_success:
         return None
-    in_block = False
-    keys: List[str] = []
-    for line in r2.text.splitlines():
-        s = line.strip()
-        if s == "===BEGIN HOST PUBLIC KEYS===":
-            in_block = True
-        elif s == "===END HOST PUBLIC KEYS===":
-            return keys
-        elif in_block and s:
+    lines = [l.strip() for l in r2.text.splitlines()]
+    lines.reverse()
+    keys: Optional[List[str]] = None
+    for s in lines:
+        if s == "===END HOST PUBLIC KEYS===":
+            keys = []
+        elif s == "===BEGIN HOST PUBLIC KEYS===":
+            return keys if keys else None
+        elif keys is not None and s:
             parts = s.split()
             if len(parts) >= 2:
                 keys.append(f"{parts[0]} {parts[1]}")
