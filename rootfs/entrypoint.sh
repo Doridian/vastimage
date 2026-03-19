@@ -17,4 +17,4 @@ echo '===END HOST PUBLIC KEYS==='
 
 export -p > /run/container-env
 
-exec dropbear -F -E -s -p 2222
+exec dropbear -F -s -p 2222

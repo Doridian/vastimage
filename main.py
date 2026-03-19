@@ -221,7 +221,7 @@ async def fetch_host_pubkeys(client: httpx.AsyncClient, instance_id: int) -> Opt
     r = await client.put(
         f"{VAST_API_BASE}/instances/request_logs/{instance_id}/",
         headers=vast_headers(),
-        json={"tail": "1000"},
+        json={"tail": "100"},
     )
     if not r.is_success:
         return None
