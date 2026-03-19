@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-export LLAMA_MODEL_URL="$1"
+. /run/container-env
 
 if [ ! -f /models/download.gguf ]; then
     echo "Downloading model from ${LLAMA_MODEL_URL}"

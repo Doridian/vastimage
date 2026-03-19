@@ -35,6 +35,7 @@ import asyncio
 import logging
 import os
 import re
+import tempfile
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -97,6 +98,7 @@ state_lock = asyncio.Lock()
 current_instance_id: Optional[int] = None
 instance_ready = False
 ssh_process: Optional[asyncio.subprocess.Process] = None
+known_hosts_file: Optional[str] = None
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -230,17 +232,42 @@ async def check_tcp_port(ip: str, port: int) -> bool:
         return False
 
 
-async def connect_instance(ip: str, host_port: int) -> asyncio.subprocess.Process:
+async def fetch_host_pubkeys(client: httpx.AsyncClient, instance_id: int) -> Optional[List[str]]:
+    r = await client.get(f"{VAST_API_BASE}/instances/logs/{instance_id}/", headers=vast_headers())
+    if not r.is_success:
+        return None
+    in_block = False
+    keys: List[str] = []
+    for line in r.text.splitlines():
+        s = line.strip()
+        if s == "===BEGIN HOST PUBLIC KEYS===":
+            in_block = True
+        elif s == "===END HOST PUBLIC KEYS===":
+            return keys
+        elif in_block and s:
+            keys.append(s)
+    return None
+
+
+def write_known_hosts(ip: str, host_port: int, keys: List[str]) -> str:
+    fd, path = tempfile.mkstemp(suffix=".known_hosts")
+    with os.fdopen(fd, "w") as f:
+        for key in keys:
+            f.write(f"[{ip}]:{host_port} {key}\n")
+    return path
+
+
+async def connect_instance(ip: str, host_port: int, known_hosts_path: str) -> asyncio.subprocess.Process:
     cmd = [
         "ssh",
         "-L", f"{LLAMA_PORT}:127.0.0.1:8080",
         "-p", str(host_port),
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "StrictHostKeyChecking=yes",
+        "-o", f"UserKnownHostsFile={known_hosts_path}",
         "-o", "ServerAliveInterval=10",
         "-o", "ServerAliveCountMax=3",
         f"{SSH_USER}@{ip}",
-        f"exec /server.sh {LLAMA_MODEL_URL}",
+        "exec /server.sh",
     ]
     log.info("Connecting to instance: %s", " ".join(cmd))
     return await asyncio.create_subprocess_exec(*cmd)
@@ -443,7 +470,7 @@ async def choose_or_create_instance(client: httpx.AsyncClient) -> int:
 
 
 async def ensure_instance_ready() -> None:
-    global current_instance_id, instance_ready, ssh_process
+    global current_instance_id, instance_ready, ssh_process, known_hosts_file
 
     async with httpx.AsyncClient(timeout=60.0) as client:
         instance_id = await choose_or_create_instance(client)
@@ -476,10 +503,17 @@ async def ensure_instance_ready() -> None:
                     ip, host_port = conn
                     log.info("Probing SSH port %s:%s", ip, host_port)
                     if await check_tcp_port(ip, host_port):
-                        log.info("SSH port available, starting tunnel")
-                        ssh_process = await connect_instance(ip, host_port)
+                        log.info("SSH port available, fetching host keys...")
+                        keys = await fetch_host_pubkeys(client, instance_id)
+                        if not keys:
+                            log.info("Host public keys not yet in logs, retrying...")
+                            await asyncio.sleep(HEALTHCHECK_INTERVAL)
+                            continue
+                        known_hosts_file = write_known_hosts(ip, host_port, keys)
+                        log.info("Host keys written to %s", known_hosts_file)
+                        ssh_process = await connect_instance(ip, host_port, known_hosts_file)
                         instance_ready = True
-                        log.info("SSH tunnel started for instance %s", instance_id)
+                        log.info("Connected to instance %s", instance_id)
                         return
                     log.info("SSH port not yet available at %s:%s, retrying...", ip, host_port)
             except Exception as exc:
@@ -516,6 +550,8 @@ async def main() -> None:
                 await asyncio.wait_for(ssh_process.wait(), timeout=5.0)
             except Exception:
                 ssh_process.kill()
+        if known_hosts_file is not None:
+            os.unlink(known_hosts_file)
         if current_instance_id is not None:
             async with httpx.AsyncClient(timeout=60.0) as client:
                 if INSTANCE_ACTION == "destroy":
