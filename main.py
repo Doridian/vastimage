@@ -254,9 +254,7 @@ async def fetch_host_pubkeys(client: httpx.AsyncClient, instance_id: int) -> Opt
         elif s == "===BEGIN HOST PUBLIC KEYS===":
             return keys if keys else None
         elif keys is not None and s:
-            parts = s.split()
-            if len(parts) >= 2:
-                keys.append(f"{parts[0]} {parts[1]}")
+            keys.append(s)
     return None
 
 
