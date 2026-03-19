@@ -96,7 +96,6 @@ log = logging.getLogger("vast-instance")
 state_lock = asyncio.Lock()
 
 current_instance_id: Optional[int] = None
-instance_ready = False
 ssh_process: Optional[asyncio.subprocess.Process] = None
 known_hosts_file: Optional[str] = None
 
@@ -480,7 +479,7 @@ async def choose_or_create_instance(client: httpx.AsyncClient) -> int:
 
 
 async def ensure_instance_ready() -> None:
-    global current_instance_id, instance_ready, ssh_process, known_hosts_file
+    global current_instance_id, ssh_process, known_hosts_file
 
     async with httpx.AsyncClient(timeout=60.0) as client:
         instance_id = await choose_or_create_instance(client)
@@ -493,6 +492,8 @@ async def ensure_instance_ready() -> None:
 
         deadline = now() + STARTUP_TIMEOUT
         last_err: Optional[Exception] = None
+        ip: Optional[str] = None
+        host_port: Optional[int] = None
 
         while now() < deadline:
             try:
@@ -513,27 +514,34 @@ async def ensure_instance_ready() -> None:
                     ip, host_port = conn
                     if not await check_tcp_port(ip, host_port):
                         log.info("SSH port not yet reachable at %s:%s, retrying...", ip, host_port)
+                        ip = None
+                        host_port = None
                         await asyncio.sleep(HEALTHCHECK_INTERVAL)
                         continue
-                    log.info("Fetching host public keys for instance %s", instance_id)
-                    keys = await fetch_host_pubkeys(client, instance_id)
-                    known_hosts_file = write_known_hosts(ip, host_port, keys)
-                    log.info("Host keys written to %s", known_hosts_file)
-                    ssh_process = await connect_instance(ip, host_port, known_hosts_file)
-                    instance_ready = True
-                    log.info("Connected to instance %s", instance_id)
-                    return
+                    break
             except Exception as exc:
                 last_err = exc
                 log.warning("Error polling instance %s: %s", instance_id, exc)
 
             await asyncio.sleep(HEALTHCHECK_INTERVAL)
 
-        detail = f"Timed out waiting for instance {instance_id} / SSH readiness"
-        if last_err:
-            detail += f": {last_err}"
-        raise RuntimeError(detail)
+        if not ip or not host_port:
+            detail = f"Timed out waiting for instance {instance_id} / SSH readiness"
+            if last_err:
+                detail += f": {last_err}"
+            raise RuntimeError(detail)
 
+        log.info("Fetching host public keys for instance %s", instance_id)
+        keys = await fetch_host_pubkeys(client, instance_id)
+        if not keys:
+            if keys is None:
+                raise RuntimeError(f"Failed to fetch host public keys for instance {instance_id}: Not in log")
+            else:
+                raise RuntimeError(f"Failed to fetch host public keys for instance {instance_id}: Empty keys block")
+        known_hosts_file = write_known_hosts(ip, host_port, keys)
+        log.info("Host keys written to %s", known_hosts_file)
+        ssh_process = await connect_instance(ip, host_port, known_hosts_file)
+        log.info("Connected to instance %s", instance_id)
 
 # -----------------------------------------------------------------------------
 # Main
