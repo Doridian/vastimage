@@ -217,6 +217,19 @@ def get_ssh_host_and_port(instance: Dict[str, Any]) -> Optional[Tuple[str, int]]
     return (ip, int(host_port))
 
 
+async def check_tcp_port(ip: str, port: int) -> bool:
+    try:
+        _, writer = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout=5.0)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
 async def fetch_host_pubkeys(client: httpx.AsyncClient, instance_id: int) -> Optional[List[str]]:
     r = await client.put(
         f"{VAST_API_BASE}/instances/request_logs/{instance_id}/",
@@ -260,6 +273,7 @@ async def connect_instance(ip: str, host_port: int, known_hosts_path: str) -> as
         "ssh",
         "-L", f"{LLAMA_PORT}:127.0.0.1:8080",
         "-p", str(host_port),
+        "-o", "ConnectTimeout=5",
         "-o", "StrictHostKeyChecking=yes",
         "-o", f"UserKnownHostsFile={known_hosts_path}",
         "-o", "ServerAliveInterval=10",
@@ -499,12 +513,12 @@ async def ensure_instance_ready() -> None:
                         await asyncio.sleep(HEALTHCHECK_INTERVAL)
                         continue
                     ip, host_port = conn
-                    log.info("Fetching host public keys for instance %s", instance_id)
-                    keys = await fetch_host_pubkeys(client, instance_id)
-                    if not keys:
-                        log.info("Host public keys not yet in logs, retrying...")
+                    if not await check_tcp_port(ip, host_port):
+                        log.info("SSH port not yet reachable at %s:%s, retrying...", ip, host_port)
                         await asyncio.sleep(HEALTHCHECK_INTERVAL)
                         continue
+                    log.info("Fetching host public keys for instance %s", instance_id)
+                    keys = await fetch_host_pubkeys(client, instance_id)
                     known_hosts_file = write_known_hosts(ip, host_port, keys)
                     log.info("Host keys written to %s", known_hosts_file)
                     ssh_process = await connect_instance(ip, host_port, known_hosts_file)
