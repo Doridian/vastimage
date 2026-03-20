@@ -1,9 +1,10 @@
 import asyncio
+import logging
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from config import log
+log = logging.getLogger("vast-instance")
 
 
 def now() -> float:

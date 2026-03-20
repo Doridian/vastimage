@@ -1,16 +1,11 @@
 import asyncio
-from typing import Any, Dict, List, Optional, Tuple
+import logging
+import os
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 import httpx
 
-from config import (
-    HEALTHCHECK_INTERVAL,
-    MAX_HOURLY_PRICE,
-    MODEL_NAME,
-    PICK_CONFIGS,
-    STARTUP_TIMEOUT,
-    log,
-)
 from ssh import connect_instance, write_known_hosts
 from utils import (
     check_tcp_port,
@@ -21,159 +16,230 @@ from utils import (
     instance_destroyed,
     now,
 )
-from vast_api import (
-    fetch_host_pubkeys,
-    vast_create_instance_from_offer,
-    vast_manage_instance,
-    vast_search_offers,
-    vast_show_instance,
-    vast_show_instances,
-)
+from vast_api import VastAPI
 
-# -----------------------------------------------------------------------------
-# Mutable state
-# -----------------------------------------------------------------------------
-
-current_instance_id: Optional[int] = None
-ssh_process: Optional[asyncio.subprocess.Process] = None
-known_hosts_file: Optional[str] = None
-
-# -----------------------------------------------------------------------------
-# Selection logic
-# -----------------------------------------------------------------------------
+log = logging.getLogger("vast-instance")
 
 
-def rank_existing_instance(instance: Dict[str, Any]) -> Tuple[int, float, int]:
-    running_score = 0 if infer_running(instance) else 1
-    price = extract_price_per_hour(instance) or 999999.0
-    return (running_score, price, int(instance.get("id", 1_000_000_000)))
+class Instance:
+    def __init__(
+        self,
+        api: VastAPI,
+        *,
+        model_name: str,
+        gpu_search: str,
+        gpu_exclude: List[str],
+        script_template: str,
+        max_hourly_price: float = 1.0,
+        startup_timeout: int = 3600,
+        healthcheck_interval: float = 3.0,
+        instance_action: str = "stop",
+        vast_image: str = "ghcr.io/doridian/vastimage/vastimage:latest",
+        vast_disk_gb: float = 100.0,
+        instance_label: str = "vastimage-controlled",
+        local_port: int = 6969,
+        prefer_verified: bool = True,
+        require_reliability_gte: float = 0.95,
+        search_limit: int = 500,
+    ) -> None:
+        self._api = api
+        self._model_name = model_name
+        self._gpu_search = gpu_search
+        self._gpu_exclude = gpu_exclude
+        self._script_template = script_template
+        self._max_hourly_price = max_hourly_price
+        self._startup_timeout = startup_timeout
+        self._healthcheck_interval = healthcheck_interval
+        self._instance_action = instance_action
+        self._vast_image = vast_image
+        self._vast_disk_gb = vast_disk_gb
+        self._instance_label = instance_label
+        self._local_port = local_port
+        self._prefer_verified = prefer_verified
+        self._require_reliability_gte = require_reliability_gte
+        self._search_limit = search_limit
 
+        self._instance_id: Optional[int] = None
+        self._ssh_process: Optional[asyncio.subprocess.Process] = None
+        self._known_hosts_file: Optional[str] = None
 
-def rank_offer(offer: Dict[str, Any]) -> Tuple[float, float, int]:
-    price = extract_price_per_hour(offer) or 999999.0
-    reliability = float(offer.get("reliability", 0.0) or 0.0)
-    return (price, -reliability, int(offer.get("id", 1_000_000_000)))
+    @asynccontextmanager
+    async def start(self) -> AsyncIterator["Instance"]:
+        await self._ensure_ready()
+        try:
+            yield self
+        finally:
+            await self._cleanup()
 
+    async def wait(self) -> None:
+        """Wait until the SSH tunnel exits, or block forever if there is none."""
+        if self._ssh_process is not None:
+            await self._ssh_process.wait()
+        else:
+            await asyncio.Event().wait()
 
-async def choose_or_create_instance(
-    client: httpx.AsyncClient,
-    offers: List[Dict[str, Any]],
-    gpu_search: str,
-    gpu_exclude: List[str],
-) -> int:
-    # Reuse existing matching instance if any.
-    instances = await vast_show_instances(client)
-    matches = [
-        i for i in instances
-        if gpu_matches(str(i.get("gpu_name") or ""), gpu_search, gpu_exclude)
-        and not instance_destroyed(i)
-    ]
-    if matches:
-        matches.sort(key=rank_existing_instance)
-        chosen = matches[0]
-        iid = int(chosen["id"])
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _rank_existing(self, instance: Dict[str, Any]) -> Tuple[int, float, int]:
+        running_score = 0 if infer_running(instance) else 1
+        price = extract_price_per_hour(instance) or 999999.0
+        return (running_score, price, int(instance.get("id", 1_000_000_000)))
+
+    @staticmethod
+    def _rank_offer(offer: Dict[str, Any]) -> Tuple[float, float, int]:
+        price = extract_price_per_hour(offer) or 999999.0
+        reliability = float(offer.get("reliability", 0.0) or 0.0)
+        return (price, -reliability, int(offer.get("id", 1_000_000_000)))
+
+    async def _choose_or_create(
+        self,
+        client: httpx.AsyncClient,
+        offers: List[Dict[str, Any]],
+    ) -> int:
+        instances = await self._api.show_instances(client)
+        matches = [
+            i for i in instances
+            if gpu_matches(str(i.get("gpu_name") or ""), self._gpu_search, self._gpu_exclude)
+            and not instance_destroyed(i)
+            and i.get("label") == self._instance_label
+        ]
+        if matches:
+            matches.sort(key=self._rank_existing)
+            chosen = matches[0]
+            iid = int(chosen["id"])
+            log.info(
+                "Reusing existing instance id=%s gpu=%s status=%s",
+                iid, chosen.get("gpu_name"),
+                chosen.get("actual_status") or chosen.get("cur_state") or chosen.get("status"),
+            )
+            return iid
+
+        candidates = [
+            o for o in offers
+            if gpu_matches(str(o.get("gpu_name") or ""), self._gpu_search, self._gpu_exclude)
+        ]
+        if not candidates:
+            raise RuntimeError(f"No matching '{self._gpu_search}' offers found on Vast")
+
+        candidates.sort(key=self._rank_offer)
+        best = candidates[0]
+        best_price = extract_price_per_hour(best)
+        if best_price is None:
+            raise RuntimeError("Matching offer found but price could not be determined")
+        if best_price > self._max_hourly_price:
+            raise RuntimeError(
+                f"Cheapest '{self._gpu_search}' offer costs ${best_price:.2f}/hr, "
+                f"above --max-hourly-price=${self._max_hourly_price:.2f}/hr"
+            )
+
         log.info(
-            "Reusing existing instance id=%s gpu=%s status=%s",
-            iid, chosen.get("gpu_name"),
-            chosen.get("actual_status") or chosen.get("cur_state") or chosen.get("status"),
+            "Creating instance from offer id=%s gpu=%s price=$%.2f/hr",
+            best.get("id"), best.get("gpu_name"), best_price,
         )
-        return iid
-
-    # Find cheapest matching offer.
-    candidates = [
-        o for o in offers
-        if gpu_matches(str(o.get("gpu_name") or ""), gpu_search, gpu_exclude)
-    ]
-    if not candidates:
-        raise RuntimeError(f"No matching '{gpu_search}' offers found on Vast")
-
-    candidates.sort(key=rank_offer)
-    best = candidates[0]
-    best_price = extract_price_per_hour(best)
-    if best_price is None:
-        raise RuntimeError("Matching offer found but price could not be determined")
-    if best_price > MAX_HOURLY_PRICE:
-        raise RuntimeError(
-            f"Cheapest '{gpu_search}' offer costs ${best_price:.2f}/hr, "
-            f"above MAX_HOURLY_PRICE=${MAX_HOURLY_PRICE:.2f}/hr"
+        return await self._api.create_instance_from_offer(
+            client, best,
+            disk_gb=self._vast_disk_gb,
+            label=self._instance_label,
+            image=self._vast_image,
         )
 
-    log.info(
-        "Creating instance from offer id=%s gpu=%s price=$%.2f/hr",
-        best.get("id"), best.get("gpu_name"), best_price,
-    )
-    return await vast_create_instance_from_offer(client, best)
+    async def _ensure_ready(self) -> None:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            log.info("Fetching Vast.ai GPU offers")
+            offers = await self._api.search_offers(
+                client,
+                prefer_verified=self._prefer_verified,
+                require_reliability_gte=self._require_reliability_gte,
+                search_limit=self._search_limit,
+            )
 
+            instance_id = await self._choose_or_create(client, offers)
+            self._instance_id = instance_id
 
-async def ensure_instance_ready(pick_mode: str) -> None:
-    global current_instance_id, ssh_process, known_hosts_file
+            instance = await self._api.show_instance(client, instance_id)
+            if not infer_running(instance):
+                log.info("Starting instance %s", instance_id)
+                await self._api.manage_instance(client, instance_id, "running")
 
-    cfg = PICK_CONFIGS[pick_mode]
-    gpu_search: str = cfg["gpu_search"]
-    gpu_exclude: List[str] = cfg["gpu_exclude"]
-    trtllm_quant: str = cfg["trtllm_quant"]
+            deadline = now() + self._startup_timeout
+            last_err: Optional[Exception] = None
+            ip: Optional[str] = None
+            host_port: Optional[int] = None
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        log.info("Fetching Vast.ai GPU offers")
-        offers = await vast_search_offers(client)
+            while now() < deadline:
+                try:
+                    instance = await self._api.show_instance(client, instance_id)
+                    status = (
+                        instance.get("actual_status")
+                        or instance.get("cur_state")
+                        or instance.get("status")
+                        or "unknown"
+                    )
+                    log.info("Instance %s status: %s", instance_id, status)
+                    if infer_running(instance):
+                        conn = get_ssh_host_and_port(instance)
+                        if not conn:
+                            log.info("Waiting for port mapping on instance %s...", instance_id)
+                            await asyncio.sleep(self._healthcheck_interval)
+                            continue
+                        ip, host_port = conn
+                        if not await check_tcp_port(ip, host_port):
+                            log.info("SSH port not yet reachable at %s:%s, retrying...", ip, host_port)
+                            ip = None
+                            host_port = None
+                            await asyncio.sleep(self._healthcheck_interval)
+                            continue
+                        break
+                except Exception as exc:
+                    last_err = exc
+                    log.warning("Error polling instance %s: %s", instance_id, exc)
 
-        instance_id = await choose_or_create_instance(client, offers, gpu_search, gpu_exclude)
-        current_instance_id = instance_id
+                await asyncio.sleep(self._healthcheck_interval)
 
-        instance = await vast_show_instance(client, instance_id)
-        if not infer_running(instance):
-            log.info("Starting instance %s", instance_id)
-            await vast_manage_instance(client, instance_id, "running")
+            if not ip or not host_port:
+                detail = f"Timed out waiting for instance {instance_id} / SSH readiness"
+                if last_err:
+                    detail += f": {last_err}"
+                raise RuntimeError(detail)
 
-        deadline = now() + STARTUP_TIMEOUT
-        last_err: Optional[Exception] = None
-        ip: Optional[str] = None
-        host_port: Optional[int] = None
+            log.info("Fetching host public keys for instance %s", instance_id)
+            keys = await self._api.fetch_host_pubkeys(client, instance_id)
+            if not keys:
+                if keys is None:
+                    raise RuntimeError(
+                        f"Failed to fetch host public keys for instance {instance_id}: Not in log"
+                    )
+                else:
+                    raise RuntimeError(
+                        f"Failed to fetch host public keys for instance {instance_id}: Empty keys block"
+                    )
+            self._known_hosts_file = write_known_hosts(ip, host_port, keys)
+            log.info("Host keys written to %s", self._known_hosts_file)
+            self._ssh_process = await connect_instance(
+                ip, host_port, self._known_hosts_file,
+                self._model_name, self._script_template, self._local_port,
+            )
+            log.info("Connected to instance %s", instance_id)
 
-        while now() < deadline:
+    async def _cleanup(self) -> None:
+        if self._ssh_process is not None:
+            log.info("Terminating SSH tunnel")
+            self._ssh_process.terminate()
             try:
-                instance = await vast_show_instance(client, instance_id)
-                status = (
-                    instance.get("actual_status")
-                    or instance.get("cur_state")
-                    or instance.get("status")
-                    or "unknown"
-                )
-                log.info("Instance %s status: %s", instance_id, status)
-                if infer_running(instance):
-                    conn = get_ssh_host_and_port(instance)
-                    if not conn:
-                        log.info("Waiting for port mapping on instance %s...", instance_id)
-                        await asyncio.sleep(HEALTHCHECK_INTERVAL)
-                        continue
-                    ip, host_port = conn
-                    if not await check_tcp_port(ip, host_port):
-                        log.info("SSH port not yet reachable at %s:%s, retrying...", ip, host_port)
-                        ip = None
-                        host_port = None
-                        await asyncio.sleep(HEALTHCHECK_INTERVAL)
-                        continue
-                    break
-            except Exception as exc:
-                last_err = exc
-                log.warning("Error polling instance %s: %s", instance_id, exc)
+                await asyncio.wait_for(self._ssh_process.wait(), timeout=5.0)
+            except Exception:
+                self._ssh_process.kill()
 
-            await asyncio.sleep(HEALTHCHECK_INTERVAL)
+        if self._known_hosts_file is not None:
+            os.unlink(self._known_hosts_file)
 
-        if not ip or not host_port:
-            detail = f"Timed out waiting for instance {instance_id} / SSH readiness"
-            if last_err:
-                detail += f": {last_err}"
-            raise RuntimeError(detail)
-
-        log.info("Fetching host public keys for instance %s", instance_id)
-        keys = await fetch_host_pubkeys(client, instance_id)
-        if not keys:
-            if keys is None:
-                raise RuntimeError(f"Failed to fetch host public keys for instance {instance_id}: Not in log")
-            else:
-                raise RuntimeError(f"Failed to fetch host public keys for instance {instance_id}: Empty keys block")
-        known_hosts_file = write_known_hosts(ip, host_port, keys)
-        log.info("Host keys written to %s", known_hosts_file)
-        ssh_process = await connect_instance(ip, host_port, known_hosts_file, MODEL_NAME, trtllm_quant)
-        log.info("Connected to instance %s", instance_id)
+        if self._instance_id is not None:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                if self._instance_action == "destroy":
+                    log.info("Destroying instance %s", self._instance_id)
+                    await self._api.destroy_instance(client, self._instance_id)
+                else:
+                    log.info("Stopping instance %s", self._instance_id)
+                    await self._api.manage_instance(client, self._instance_id, "stopped")

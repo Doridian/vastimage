@@ -3,8 +3,6 @@ import os
 import tempfile
 from typing import List
 
-from config import LOCAL_LLAMA_PORT, SERVER_SH, log
-
 
 def write_known_hosts(ip: str, host_port: int, keys: List[str]) -> str:
     fd, path = tempfile.mkstemp(suffix=".known_hosts")
@@ -14,12 +12,18 @@ def write_known_hosts(ip: str, host_port: int, keys: List[str]) -> str:
     return path
 
 
-async def connect_instance(ip: str, host_port: int, known_hosts_path: str, model_name: str, trtllm_quant: str) -> asyncio.subprocess.Process:
-    quant_flag = f'--quantization "{trtllm_quant}"' if trtllm_quant else ""
-    script = SERVER_SH.format(model_name=model_name, quant_flag=quant_flag)
+async def connect_instance(
+    ip: str,
+    host_port: int,
+    known_hosts_path: str,
+    model_name: str,
+    script_template: str,
+    local_port: int,
+) -> asyncio.subprocess.Process:
+    script = script_template.format(model_name=model_name)
     cmd = [
         "ssh",
-        "-L", f"{LOCAL_LLAMA_PORT}:127.0.0.1:8080",
+        "-L", f"{local_port}:127.0.0.1:8080",
         "-p", str(host_port),
         "-o", "ConnectTimeout=5",
         "-o", "StrictHostKeyChecking=yes",
@@ -29,7 +33,8 @@ async def connect_instance(ip: str, host_port: int, known_hosts_path: str, model
         f"fox@{ip}",
         "sh",
     ]
-    log.info("Connecting to instance: %s", " ".join(cmd))
+    import logging
+    logging.getLogger("vast-instance").info("Connecting to instance: %s", " ".join(cmd))
     proc = await asyncio.create_subprocess_exec(*cmd, stdin=asyncio.subprocess.PIPE)
     proc.stdin.write(script.encode())
     await proc.stdin.drain()
