@@ -1,25 +1,15 @@
-FROM ubuntu:24.04
-
 ARG CUDA_MAJOR=13
-ARG CUDA_MINOR=0
+ARG CUDA_MINOR=0.0
+FROM nvcr.io/nvidia/cuda:${CUDA_MAJOR}.${CUDA_MINOR}-cudnn-runtime-ubuntu24.04
+
 ENV CUDA_MAJOR=${CUDA_MAJOR}
 ENV CUDA_MINOR=${CUDA_MINOR}
 
 RUN apt-get update && \
-    apt-get dist-upgrade -y && \
     apt-get install -y --no-install-recommends \
             curl \
             ca-certificates \
-        && \
-    curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb -o /tmp/cuda-keyring.deb && \
-    dpkg -i /tmp/cuda-keyring.deb && \
-    rm /tmp/cuda-keyring.deb && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends \
-            cuda-compat-${CUDA_MAJOR}-${CUDA_MINOR} \
-            cuda-libraries-${CUDA_MAJOR}-${CUDA_MINOR} \
             dropbear \
-            libcudnn9-cuda-${CUDA_MAJOR} \
             libnvidia-ml-dev \
             libopenmpi-dev \
             libpython3-dev \
