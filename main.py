@@ -10,7 +10,7 @@ Behavior:
 - Otherwise find the cheapest matching offer on Vast
 - Create a new instance only if the cheapest offer is <= MAX_HOURLY_PRICE
 - Start the instance and wait for SSH port to become available
-- Open an SSH local-port-forward tunnel (localhost:6666 -> remote:6666)
+- Open an SSH local-port-forward tunnel (localhost:6969 -> remote:8080)
 - Stop or destroy the instance on exit
 
 Requirements:
@@ -19,8 +19,8 @@ Requirements:
 Example:
     export VAST_API_KEY="..."
 
-    # Required: model to load in llama.cpp
-    export LLAMA_MODEL_URL="https://huggingface.co/unsloth/Qwen3-Coder-Next-GGUF/resolve/main/Qwen3-Coder-Next-UD-Q4_K_XL.gguf"
+    # Required: HuggingFace model ID to serve with TensorRT-LLM
+    export MODEL_NAME="Qwen/Qwen2.5-Coder-32B-Instruct"
 
     # Optional HF token for gated/private models
     export HF_TOKEN="hf_..."
@@ -68,8 +68,8 @@ VAST_IMAGE = os.environ.get("VAST_IMAGE", "ghcr.io/doridian/vastimage/vastimage:
 VAST_DISK_GB = float(os.environ.get("VAST_DISK_GB", "100"))
 INSTANCE_LABEL = os.environ.get("INSTANCE_LABEL", "vastimage-controlled").strip()
 
-# llama.cpp env options
-LLAMA_MODEL_URL = os.environ.get("LLAMA_MODEL_URL", "").strip()
+# TensorRT-LLM model config
+MODEL_NAME = os.environ.get("MODEL_NAME", "").strip()
 
 # Shutdown action
 INSTANCE_ACTION = os.environ.get("INSTANCE_ACTION", "stop").strip().lower()  # stop | destroy
@@ -78,8 +78,8 @@ LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
 if not VAST_API_KEY:
     raise RuntimeError("VAST_API_KEY is required")
-if not LLAMA_MODEL_URL:
-    raise RuntimeError("LLAMA_MODEL_URL is required")
+if not MODEL_NAME:
+    raise RuntimeError("MODEL_NAME is required")
 if INSTANCE_ACTION not in {"stop", "destroy"}:
     raise RuntimeError("INSTANCE_ACTION must be 'stop' or 'destroy'")
 
@@ -370,7 +370,7 @@ async def vast_create_instance_from_offer(client: httpx.AsyncClient, offer: Dict
         raise RuntimeError("Offer missing ask ID")
 
     env: Dict[str, str] = {f"-p {VAST_SSH_PORT}:{VAST_SSH_PORT}": "1"}
-    env["LLAMA_MODEL_URL"] = LLAMA_MODEL_URL
+    env["MODEL_NAME"] = MODEL_NAME
 
     body: Dict[str, Any] = {
         "disk": VAST_DISK_GB,
