@@ -6,13 +6,9 @@ RUN apt-get update && \
             curl \
             ca-certificates \
             dropbear \
-            libnvidia-ml-dev \
         && \
     rm -rf /var/lib/apt/lists/* /etc/dropbear && \
     useradd -m -s /bin/bash fox
-
-ENV PATH=/usr/local/cuda/bin:$PATH
-ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/compat/lib.real:$LD_LIBRARY_PATH
 
 COPY rootfs/ /
 

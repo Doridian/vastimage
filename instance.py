@@ -41,6 +41,7 @@ class Instance:
         require_reliability_gte: float = 0.95,
         search_limit: int = 500,
         offer_selector: Optional[Callable[[List[Dict[str, Any]]], Awaitable[Dict[str, Any]]]] = None,
+        existing_instance_selector: Optional[Callable[[List[Dict[str, Any]]], Awaitable[Optional[Dict[str, Any]]]]] = None,
     ) -> None:
         self._api = api
         self._gpu_search = gpu_search
@@ -58,6 +59,7 @@ class Instance:
         self._require_reliability_gte = require_reliability_gte
         self._search_limit = search_limit
         self._offer_selector = offer_selector
+        self._existing_instance_selector = existing_instance_selector
 
         self._instance_id: Optional[int] = None
         self._ssh_process: Optional[asyncio.subprocess.Process] = None
@@ -97,22 +99,35 @@ class Instance:
         offers: List[Dict[str, Any]],
     ) -> int:
         instances = await self._api.show_instances(client)
-        matches = [
-            i for i in instances
-            if gpu_matches(str(i.get("gpu_name") or ""), self._gpu_search, self._gpu_exclude)
-            and not instance_destroyed(i)
-            and i.get("label") == self._instance_label
-        ]
-        if matches:
-            matches.sort(key=self._rank_existing)
-            chosen = matches[0]
-            iid = int(chosen["id"])
-            log.info(
-                "Reusing existing instance id=%s gpu=%s status=%s",
-                iid, chosen.get("gpu_name"),
-                chosen.get("actual_status") or chosen.get("cur_state") or chosen.get("status"),
-            )
-            return iid
+        all_active = [i for i in instances if not instance_destroyed(i)]
+
+        if self._existing_instance_selector is not None and all_active:
+            result = await self._existing_instance_selector(all_active)
+            if result is not None:
+                chosen = result
+                iid = int(chosen["id"])
+                log.info(
+                    "Reusing existing instance id=%s gpu=%s status=%s",
+                    iid, chosen.get("gpu_name"),
+                    chosen.get("actual_status") or chosen.get("cur_state") or chosen.get("status"),
+                )
+                return iid
+        else:
+            matches = [
+                i for i in all_active
+                if gpu_matches(str(i.get("gpu_name") or ""), self._gpu_search, self._gpu_exclude)
+                and i.get("label") == self._instance_label
+            ]
+            if matches:
+                matches.sort(key=self._rank_existing)
+                chosen = matches[0]
+                iid = int(chosen["id"])
+                log.info(
+                    "Reusing existing instance id=%s gpu=%s status=%s",
+                    iid, chosen.get("gpu_name"),
+                    chosen.get("actual_status") or chosen.get("cur_state") or chosen.get("status"),
+                )
+                return iid
 
         candidates = [
             o for o in offers

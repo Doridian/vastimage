@@ -24,7 +24,7 @@ Example:
 import argparse
 import asyncio
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import questionary
 
@@ -32,6 +32,23 @@ import config
 from instance import Instance
 from utils import extract_price_per_hour
 from vast_api import VastAPI
+
+
+async def _ask_existing_instance(instances: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    def _row(inst: Dict[str, Any]) -> str:
+        gpu = str(inst.get("gpu_name") or "?")
+        price = extract_price_per_hour(inst)
+        price_str = f"${price:.3f}/hr" if price is not None else "?/hr"
+        status = inst.get("actual_status") or inst.get("cur_state") or inst.get("status") or "?"
+        label = inst.get("label") or ""
+        return f"{gpu:<20}  {price_str:>10}  {status:<12}  {label}"
+
+    choices = [questionary.Choice(title=_row(i), value=i) for i in instances]
+    choices.append(questionary.Choice(title="(create new instance)", value=None))
+    selected = await asyncio.to_thread(
+        questionary.select("Select an existing instance to reuse:", choices=choices).ask
+    )
+    return selected
 
 
 async def _ask_offer(candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -69,8 +86,8 @@ async def main() -> None:
                         help="Label for the instance, used to identify reusable instances. (default: vastimage-controlled)")
     parser.add_argument("--vast-api-base", default="https://console.vast.ai/api/v0",
                         help="Vast.ai API base URL. (default: https://console.vast.ai/api/v0)")
-    parser.add_argument("--startup-timeout", type=int, default=3600,
-                        help="Seconds to wait for instance to become ready. (default: 3600)")
+    parser.add_argument("--startup-timeout", type=int, default=900,
+                        help="Seconds to wait for instance to become ready. (default: 900)")
     parser.add_argument("--healthcheck-interval", type=float, default=3.0,
                         help="Seconds between status polls. (default: 3.0)")
     parser.add_argument("--max-hourly-price", type=float, default=2.00,
@@ -120,6 +137,7 @@ async def main() -> None:
         require_reliability_gte=args.require_reliability_gte,
         search_limit=args.search_limit,
         offer_selector=_ask_offer if args.ask else None,
+        existing_instance_selector=_ask_existing_instance if args.ask else None,
     )
 
     async with instance.start():
