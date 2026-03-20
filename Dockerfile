@@ -1,5 +1,10 @@
 FROM ubuntu:24.04
 
+ARG CUDA_MAJOR=13
+ARG CUDA_MINOR=0
+ENV CUDA_MAJOR=${CUDA_MAJOR}
+ENV CUDA_MINOR=${CUDA_MINOR}
+
 RUN apt-get update && \
     apt-get dist-upgrade -y && \
     apt-get install -y --no-install-recommends \
@@ -11,10 +16,10 @@ RUN apt-get update && \
     rm /tmp/cuda-keyring.deb && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
-            cuda-compat-13-0 \
-            cuda-libraries-13-0 \
+            cuda-compat-${CUDA_MAJOR}-${CUDA_MINOR} \
+            cuda-libraries-${CUDA_MAJOR}-${CUDA_MINOR} \
             dropbear \
-            libcudnn9-cuda-13 \
+            libcudnn9-cuda-${CUDA_MAJOR} \
             libnvidia-ml-dev \
             libopenmpi-dev \
             libpython3-dev \

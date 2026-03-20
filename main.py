@@ -320,6 +320,7 @@ async def vast_search_offers(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
         "rented": {"eq": False},
         "gpu_arch": {"eq": "nvidia"},
         "num_gpus": {"eq": 1},
+        "gpu_ram": {"gte": 70000},
         "reliability": {"gte": REQUIRE_RELIABILITY_GTE},
         "order": [["dph_total", "asc"]],
         "disable_bundling": True,
