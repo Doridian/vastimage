@@ -1,11 +1,12 @@
-FROM nvcr.io/nvidia/cuda:12.6.3-cudnn9-devel-ubuntu22.04
+FROM nvcr.io/nvidia/cuda:13.2.0-cudnn-runtime-ubuntu24.04
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends python3 python3-pip dropbear curl && \
+    apt-get dist-upgrade -y && \
+    apt-get install -y --no-install-recommends libpython3-dev python3 python3-pip dropbear curl && \
     rm -rf /var/lib/apt/lists/* /etc/dropbear && \
     useradd -m -s /bin/bash fox
 
-RUN pip3 install tensorrt-llm huggingface-hub
+RUN pip3 install --break-system-packages --ignore-installed pip setuptools wheel && pip3 install --break-system-packages tensorrt_llm huggingface-hub
 
 COPY rootfs/ /
 
