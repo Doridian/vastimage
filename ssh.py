@@ -16,11 +16,9 @@ async def connect_instance(
     ip: str,
     host_port: int,
     known_hosts_path: str,
-    model_name: str,
-    script_template: str,
+    script: str,
     local_port: int,
 ) -> asyncio.subprocess.Process:
-    script = script_template.format(model_name=model_name)
     cmd = [
         "ssh",
         "-L", f"{local_port}:127.0.0.1:8080",

@@ -24,10 +24,34 @@ Example:
 import argparse
 import asyncio
 import os
+from typing import Any, Dict, List
+
+import questionary
 
 import config
 from instance import Instance
+from utils import extract_price_per_hour
 from vast_api import VastAPI
+
+
+async def _ask_offer(candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def _row(offer: Dict[str, Any]) -> str:
+        gpu = str(offer.get("gpu_name") or "?")
+        price = extract_price_per_hour(offer)
+        price_str = f"${price:.3f}/hr" if price is not None else "?/hr"
+        reliability = offer.get("reliability")
+        rel_str = f"{float(reliability):.1%}" if reliability is not None else "  ?  "
+        verified = "verified" if offer.get("verified") else "       "
+        location = str(offer.get("geolocation") or offer.get("location") or "?")
+        return f"{gpu:<20}  {price_str:>10}  {rel_str:>6}  {verified}  {location}"
+
+    choices = [questionary.Choice(title=_row(o), value=o) for o in candidates]
+    selected = await asyncio.to_thread(
+        questionary.select("Select an offer:", choices=choices).ask
+    )
+    if selected is None:
+        raise RuntimeError("No offer selected.")
+    return selected
 
 
 async def main() -> None:
@@ -67,6 +91,8 @@ async def main() -> None:
                         help="Logging level. (default: INFO)")
     parser.add_argument("--script", default="qwen3-coder-next.sh",
                         help="Server startup script template. (default: qwen3-coder-next.sh)")
+    parser.add_argument("--ask", action="store_true",
+                        help="Interactively select an offer from a table instead of auto-picking.")
 
     args = parser.parse_args()
     
@@ -74,15 +100,14 @@ async def main() -> None:
         raise RuntimeError("VAST_API_KEY environment variable is required")
 
     with open(os.path.join("scripts", args.script), "r") as f:
-        script_template = f.read()
+        script = f.read()
 
     api = VastAPI(config.VAST_API_KEY, api_base=args.vast_api_base)
     instance = Instance(
         api,
-        model_name=args.model,
         gpu_search=args.gpu_search,
         gpu_exclude=args.gpu_exclude,
-        script_template=script_template,
+        script=script,
         max_hourly_price=args.max_hourly_price,
         startup_timeout=args.startup_timeout,
         healthcheck_interval=args.healthcheck_interval,
@@ -94,6 +119,7 @@ async def main() -> None:
         prefer_verified=args.prefer_verified,
         require_reliability_gte=args.require_reliability_gte,
         search_limit=args.search_limit,
+        offer_selector=_ask_offer if args.ask else None,
     )
 
     async with instance.start():

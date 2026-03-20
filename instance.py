@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -26,10 +26,9 @@ class Instance:
         self,
         api: VastAPI,
         *,
-        model_name: str,
         gpu_search: str,
         gpu_exclude: List[str],
-        script_template: str,
+        script: str,
         max_hourly_price: float = 1.0,
         startup_timeout: int = 3600,
         healthcheck_interval: float = 3.0,
@@ -41,12 +40,12 @@ class Instance:
         prefer_verified: bool = True,
         require_reliability_gte: float = 0.95,
         search_limit: int = 500,
+        offer_selector: Optional[Callable[[List[Dict[str, Any]]], Awaitable[Dict[str, Any]]]] = None,
     ) -> None:
         self._api = api
-        self._model_name = model_name
         self._gpu_search = gpu_search
         self._gpu_exclude = gpu_exclude
-        self._script_template = script_template
+        self._script = script
         self._max_hourly_price = max_hourly_price
         self._startup_timeout = startup_timeout
         self._healthcheck_interval = healthcheck_interval
@@ -58,6 +57,7 @@ class Instance:
         self._prefer_verified = prefer_verified
         self._require_reliability_gte = require_reliability_gte
         self._search_limit = search_limit
+        self._offer_selector = offer_selector
 
         self._instance_id: Optional[int] = None
         self._ssh_process: Optional[asyncio.subprocess.Process] = None
@@ -72,11 +72,9 @@ class Instance:
             await self._cleanup()
 
     async def wait(self) -> None:
-        """Wait until the SSH tunnel exits, or block forever if there is none."""
+        """Wait until the SSH tunnel exits"""
         if self._ssh_process is not None:
             await self._ssh_process.wait()
-        else:
-            await asyncio.Event().wait()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -124,7 +122,12 @@ class Instance:
             raise RuntimeError(f"No matching '{self._gpu_search}' offers found on Vast")
 
         candidates.sort(key=self._rank_offer)
-        best = candidates[0]
+
+        if self._offer_selector is not None:
+            best = await self._offer_selector(candidates)
+        else:
+            best = candidates[0]
+
         best_price = extract_price_per_hour(best)
         if best_price is None:
             raise RuntimeError("Matching offer found but price could not be determined")
@@ -219,7 +222,7 @@ class Instance:
             log.info("Host keys written to %s", self._known_hosts_file)
             self._ssh_process = await connect_instance(
                 ip, host_port, self._known_hosts_file,
-                self._model_name, self._script_template, self._local_port,
+                self._script, self._local_port,
             )
             log.info("Connected to instance %s", instance_id)
 
