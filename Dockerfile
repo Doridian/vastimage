@@ -38,7 +38,7 @@ RUN chown -R fox:fox /home/fox && \
     chmod 700 /home/fox /home/fox/.ssh && \
     chmod 600 /home/fox/.ssh/authorized_keys
 
-ENV MODEL_NAME=Qwen/Qwen2.5-Coder-32B-Instruct
+ENV MODEL_NAME=Qwen/Qwen3-Coder-Next
 ENV HF_HOME=/models
 
 EXPOSE 2222/tcp
