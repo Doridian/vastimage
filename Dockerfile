@@ -11,8 +11,8 @@ RUN apt-get update && \
     rm /tmp/cuda-keyring.deb && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
-            cuda-compat-13-2 \
-            cuda-libraries-13-2 \
+            cuda-compat-13-0 \
+            cuda-libraries-13-0 \
             dropbear \
             libcudnn9-cuda-13 \
             libnvidia-ml-dev \
