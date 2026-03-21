@@ -1,11 +1,12 @@
 #!/bin/sh
-set -e
-
-# w4a16_awq, fp8
+set -ex
 
 . /run/container-env
+export HOME=/models
 
-exec mpirun trtllm-serve 'Qwen/Qwen3-Coder-Next' \
-    --host 127.0.0.1 \
-    --port 8080 \
-    w4a16_awq
+ulimit -s unlimited
+#ulimit -l unlimited
+ulimit -a
+
+cd /app
+exec ./llama-server --host 127.0.0.1 --port 8080 -hf unsloth/Qwen3-Coder-Next-GGUF:UD-Q4_K_XL --threads "$(nproc)" "$@"
