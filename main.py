@@ -34,6 +34,9 @@ from utils import extract_price_per_hour
 from vast_api import VastAPI
 
 
+_CREATE_NEW = object()
+
+
 async def _ask_existing_instance(instances: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     def _row(inst: Dict[str, Any]) -> str:
         gpu = str(inst.get("gpu_name") or "?")
@@ -41,13 +44,17 @@ async def _ask_existing_instance(instances: List[Dict[str, Any]]) -> Optional[Di
         price_str = f"${price:.3f}/hr" if price is not None else "?/hr"
         status = inst.get("actual_status") or inst.get("cur_state") or inst.get("status") or "?"
         label = inst.get("label") or ""
-        return f"{gpu:<20}  {price_str:>10}  {status:<12}  {label}"
+        vram_mb = inst.get("gpu_ram")
+        vram_str = f"{int(vram_mb) // 1024}GB" if vram_mb is not None else "?GB"
+        return f"{gpu:<20}  {vram_str:>6}  {price_str:>10}  {status:<12}  {label}"
 
     choices = [questionary.Choice(title=_row(i), value=i) for i in instances]
-    choices.append(questionary.Choice(title="(create new instance)", value=None))
+    choices.append(questionary.Choice(title="(create new instance)", value=_CREATE_NEW))
     selected = await asyncio.to_thread(
         questionary.select("Select an existing instance to reuse:", choices=choices).ask
     )
+    if selected is _CREATE_NEW or selected is None:
+        return None
     return selected
 
 
@@ -60,7 +67,9 @@ async def _ask_offer(candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
         rel_str = f"{float(reliability):.1%}" if reliability is not None else "  ?  "
         verified = "verified" if offer.get("verified") else "       "
         location = str(offer.get("geolocation") or offer.get("location") or "?")
-        return f"{gpu:<20}  {price_str:>10}  {rel_str:>6}  {verified}  {location}"
+        vram_mb = offer.get("gpu_ram")
+        vram_str = f"{int(vram_mb) // 1024}GB" if vram_mb is not None else "?GB"
+        return f"{gpu:<20}  {vram_str:>6}  {price_str:>10}  {rel_str:>6}  {verified}  {location}"
 
     choices = [questionary.Choice(title=_row(o), value=o) for o in candidates]
     selected = await asyncio.to_thread(
@@ -90,8 +99,8 @@ async def main() -> None:
                         help="Seconds to wait for instance to become ready. (default: 900)")
     parser.add_argument("--healthcheck-interval", type=float, default=3.0,
                         help="Seconds between status polls. (default: 3.0)")
-    parser.add_argument("--max-hourly-price", type=float, default=2.00,
-                        help="Maximum accepted price in $/hr. (default: 2.00)")
+    parser.add_argument("--max-hourly-price", type=float, default=5.00,
+                        help="Maximum accepted price in $/hr. (default: 5.00)")
     parser.add_argument("--prefer-verified", default=True, action=argparse.BooleanOptionalAction,
                         help="Prefer verified Vast.ai hosts. (default: true)")
     parser.add_argument("--require-reliability-gte", type=float, default=0.95,

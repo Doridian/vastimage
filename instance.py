@@ -29,7 +29,7 @@ class Instance:
         gpu_search: str,
         gpu_exclude: List[str],
         script: str,
-        max_hourly_price: float = 1.0,
+        max_hourly_price: float = 5.0,
         startup_timeout: int = 3600,
         healthcheck_interval: float = 3.0,
         instance_action: str = "stop",
